@@ -1,0 +1,61 @@
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import classification_report
+from sklearn.utils import resample
+from sklearn.feature_selection import SelectFromModel
+import numpy as np
+
+# Combine 0 and 11 into one category(no clonal evolution), and 10 and 1 into another (with clonal evolution)
+file_C['FLT3_Clonal_Evolusion_Grouped'] = file_C['FLT3_Clonal_Evolution'].replace({0: '0_11', 11: '0_11', 10: '10_1', 1: '10_1'})
+target_grouped = file_C['FLT3_Clonal_Evolusion_Grouped']
+
+# Ensure the columns in file_D match the array numbers in file_C for analysis
+common_columns = file_C['Array Number'].dropna().tolist()
+file_D_filtered = file_D[common_columns]
+
+# Transpose file_D_filtered to match the format required for modeling (samples as rows)
+file_D_filtered_transposed = file_D_filtered.transpose()
+
+# Combine features and target into one DataFrame for resampling
+data_combined = file_D_filtered_transposed.copy()
+data_combined['target'] = target_grouped.values
+
+# Separate the majority and minority classes for resampling
+majority_class = data_combined[data_combined['target'] == '0_11']
+minority_class = data_combined[data_combined['target'] == '10_1']
+
+# Upsample the minority class
+minority_upsampled = resample(minority_class, 
+                              replace=True,     # sample with replacement
+                              n_samples=len(majority_class),    # to match majority class
+                              random_state=42)  # reproducible results
+
+# Combine the majority class with the upsampled minority class
+data_upsampled = pd.concat([majority_class, minority_upsampled])
+
+# Separate features and target after resampling
+X_upsampled = data_upsampled.drop('target', axis=1)
+y_upsampled = data_upsampled['target']
+
+# Perform feature selection using RandomForest
+clf_fs = RandomForestClassifier(n_estimators=100, random_state=42)
+clf_fs.fit(X_upsampled, y_upsampled)
+selector = SelectFromModel(clf_fs, prefit=True)
+X_selected = selector.transform(X_upsampled)
+
+# Split data into training and testing sets
+X_train, X_test, y_train, y_test = train_test_split(X_selected, y_upsampled, test_size=0.2, random_state=42)
+
+# Initialize a new RandomForestClassifier for the selected features
+clf_final = RandomForestClassifier(n_estimators=100, random_state=42)
+
+# Train the model
+clf_final.fit(X_train, y_train)
+
+# Make predictions on the test set
+y_pred = clf_final.predict(X_test)
+
+# Generate a classification report
+report_grouped = classification_report(y_test, y_pred, target_names=['0_11', '10_1'])
+
+report_grouped
