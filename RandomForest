@@ -1,61 +1,768 @@
-from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import classification_report
-from sklearn.utils import resample
-from sklearn.feature_selection import SelectFromModel
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Conditional binary ML for FLT3_Clonal_Evolusion from RNA-seq total counts.
+
+Input CSV format (matrix-like):
+  - Row 1 (index 0): sample IDs in columns 2..end (col 1 is a row label)
+  - Row 2 (index 1): target label FLT3_Clonal_Evolusion in columns 2..end
+  - Row 3 (index 2): optional Name in columns 2..end
+  - Row 4+ (index 3+): gene rows, first column is gene symbol, columns 2..end are counts
+
+We build two conditional tasks:
+  A) 0 vs 1 (event=1) on subset {0,1}
+  B) 10 vs 11 (event=10) on subset {10,11}
+
+Two eval modes:
+  - simplified CV: repeated stratified 5-fold, C fixed, thr=0.5
+  - nested CV: outer 5-fold (optionally repeated), inner 3-fold tuning C,
+               fold-wise thresholding in outer training to enforce sensitivity>=target
+
+Outputs:
+  - overall_summary.csv
+  - predictions_long.csv (outer test predictions)
+  - patient_mean_oos_probabilities.csv (mean out-of-sample prob per sample)
+  - fold_params_thresholds.csv (best C and threshold per outer fold)
+  - repeat_level_metrics.csv
+"""
+
+import argparse
+import os
+import math
 import numpy as np
+import pandas as pd
 
-# Combine 0 and 11 into one category(no clonal evolution), and 10 and 1 into another (with clonal evolution)
-file_C['FLT3_Clonal_Evolusion_Grouped'] = file_C['FLT3_Clonal_Evolution'].replace({0: '0_11', 11: '0_11', 10: '10_1', 1: '10_1'})
-target_grouped = file_C['FLT3_Clonal_Evolusion_Grouped']
+from sklearn.model_selection import StratifiedKFold, RepeatedStratifiedKFold
+from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    roc_auc_score,
+    average_precision_score,
+    brier_score_loss,
+)
 
-# Ensure the columns in file_D match the array numbers in file_C for analysis
-common_columns = file_C['Array Number'].dropna().tolist()
-file_D_filtered = file_D[common_columns]
+# ---------------------------
+# Utilities
+# ---------------------------
 
-# Transpose file_D_filtered to match the format required for modeling (samples as rows)
-file_D_filtered_transposed = file_D_filtered.transpose()
+def ensure_dir(p: str) -> None:
+    os.makedirs(p, exist_ok=True)
 
-# Combine features and target into one DataFrame for resampling
-data_combined = file_D_filtered_transposed.copy()
-data_combined['target'] = target_grouped.values
+def logit(p: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    p = np.clip(p, eps, 1 - eps)
+    return np.log(p / (1 - p))
 
-# Separate the majority and minority classes for resampling
-majority_class = data_combined[data_combined['target'] == '0_11']
-minority_class = data_combined[data_combined['target'] == '10_1']
+def calibration_intercept_slope(y: np.ndarray, p: np.ndarray) -> tuple[float, float]:
+    """
+    Fit: y ~ intercept + slope * logit(p)
+    Return (intercept, slope).
+    """
+    x = logit(p).reshape(-1, 1)
+    # Unpenalized logistic regression in 1D
+    m = LogisticRegression(
+        penalty="none",
+        solver="lbfgs",
+        max_iter=2000,
+    )
+    m.fit(x, y)
+    intercept = float(m.intercept_[0])
+    slope = float(m.coef_[0][0])
+    return intercept, slope
 
-# Upsample the minority class
-minority_upsampled = resample(minority_class, 
-                              replace=True,     # sample with replacement
-                              n_samples=len(majority_class),    # to match majority class
-                              random_state=42)  # reproducible results
+def bootstrap_ci(
+    y: np.ndarray,
+    p: np.ndarray,
+    n_boot: int = 2000,
+    seed: int = 1,
+) -> dict:
+    """
+    Bootstrap CIs for ROC-AUC, PR-AUC, Brier, calibration intercept/slope.
+    Uses resampling of pairs (y, p) with replacement.
+    Skips bootstrap samples lacking both classes for AUC/AP.
+    """
+    rng = np.random.default_rng(seed)
+    n = len(y)
+    stats = {
+        "auc": [],
+        "pr_auc": [],
+        "brier": [],
+        "cal_intercept": [],
+        "cal_slope": [],
+    }
 
-# Combine the majority class with the upsampled minority class
-data_upsampled = pd.concat([majority_class, minority_upsampled])
+    for _ in range(n_boot):
+        idx = rng.integers(0, n, size=n)
+        yb = y[idx]
+        pb = p[idx]
 
-# Separate features and target after resampling
-X_upsampled = data_upsampled.drop('target', axis=1)
-y_upsampled = data_upsampled['target']
+        stats["brier"].append(brier_score_loss(yb, pb))
+        try:
+            ci, cs = calibration_intercept_slope(yb, pb)
+            stats["cal_intercept"].append(ci)
+            stats["cal_slope"].append(cs)
+        except Exception:
+            # If calibration fitting fails (rare), skip
+            continue
 
-# Perform feature selection using RandomForest
-clf_fs = RandomForestClassifier(n_estimators=100, random_state=42)
-clf_fs.fit(X_upsampled, y_upsampled)
-selector = SelectFromModel(clf_fs, prefit=True)
-X_selected = selector.transform(X_upsampled)
+        # AUC/AP require both classes
+        if len(np.unique(yb)) < 2:
+            continue
+        try:
+            stats["auc"].append(roc_auc_score(yb, pb))
+            stats["pr_auc"].append(average_precision_score(yb, pb))
+        except Exception:
+            continue
 
-# Split data into training and testing sets
-X_train, X_test, y_train, y_test = train_test_split(X_selected, y_upsampled, test_size=0.2, random_state=42)
+    out = {}
+    for k, vals in stats.items():
+        if len(vals) == 0:
+            out[k] = (np.nan, np.nan, np.nan)
+            continue
+        vals = np.asarray(vals, dtype=float)
+        out[k] = (float(np.mean(vals)),
+                  float(np.quantile(vals, 0.025)),
+                  float(np.quantile(vals, 0.975)))
+    return out
 
-# Initialize a new RandomForestClassifier for the selected features
-clf_final = RandomForestClassifier(n_estimators=100, random_state=42)
+def choose_threshold_sens_constraint(
+    y_true: np.ndarray,
+    p_pred: np.ndarray,
+    target_sens: float = 0.75
+) -> dict:
+    """
+    Choose threshold t from unique predicted probabilities such that:
+      sensitivity >= target_sens
+    and among those, specificity is maximized.
+    If no threshold can reach target_sens, pick the one with highest sensitivity (then max specificity).
+    """
+    y_true = np.asarray(y_true).astype(int)
+    p_pred = np.asarray(p_pred).astype(float)
 
-# Train the model
-clf_final.fit(X_train, y_train)
+    # Candidate thresholds: unique probs plus extremes
+    ths = np.unique(p_pred)
+    ths = np.sort(np.concatenate([ths, [0.0, 1.0]]))
 
-# Make predictions on the test set
-y_pred = clf_final.predict(X_test)
+    best = None
 
-# Generate a classification report
-report_grouped = classification_report(y_test, y_pred, target_names=['0_11', '10_1'])
+    def metrics_at(t):
+        pred = (p_pred >= t).astype(int)
+        tp = int(np.sum((y_true == 1) & (pred == 1)))
+        fn = int(np.sum((y_true == 1) & (pred == 0)))
+        tn = int(np.sum((y_true == 0) & (pred == 0)))
+        fp = int(np.sum((y_true == 0) & (pred == 1)))
+        sens = tp / (tp + fn) if (tp + fn) > 0 else np.nan
+        spec = tn / (tn + fp) if (tn + fp) > 0 else np.nan
+        acc  = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else np.nan
+        return tp, fn, tn, fp, sens, spec, acc
 
-report_grouped
+    # First pass: thresholds meeting sensitivity constraint, maximize specificity
+    for t in ths:
+        tp, fn, tn, fp, sens, spec, acc = metrics_at(t)
+        if np.isnan(sens) or np.isnan(spec):
+            continue
+        if sens >= target_sens:
+            cand = (spec, sens, -t)  # prefer higher spec, then higher sens, then lower t (arbitrary tie-break)
+            if (best is None) or (cand > best["rank"]):
+                best = {
+                    "threshold": float(t),
+                    "tp": tp, "fn": fn, "tn": tn, "fp": fp,
+                    "sensitivity": float(sens),
+                    "specificity": float(spec),
+                    "accuracy": float(acc),
+                    "rank": cand,
+                    "met_constraint": True
+                }
+
+    # If none meets constraint, relax: maximize sensitivity then specificity
+    if best is None:
+        for t in ths:
+            tp, fn, tn, fp, sens, spec, acc = metrics_at(t)
+            if np.isnan(sens) or np.isnan(spec):
+                continue
+            cand = (sens, spec, -t)
+            if (best is None) or (cand > best["rank"]):
+                best = {
+                    "threshold": float(t),
+                    "tp": tp, "fn": fn, "tn": tn, "fp": fp,
+                    "sensitivity": float(sens),
+                    "specificity": float(spec),
+                    "accuracy": float(acc),
+                    "rank": cand,
+                    "met_constraint": False
+                }
+
+    best.pop("rank", None)
+    return best
+
+# ---------------------------
+# Data loading and transform
+# ---------------------------
+
+def read_matrix_like_counts(csv_path: str) -> tuple[list[str], np.ndarray, np.ndarray, list[str]]:
+    """
+    Returns:
+      sample_ids: list[str]
+      y_raw: array of raw labels as strings
+      counts: 2D array (n_samples x n_genes) counts
+      genes: list[str]
+    """
+    df = pd.read_csv(csv_path, header=None)
+    # sample IDs are row 1, columns 2..end (index 1..end-1 since col0 is row label)
+    sample_ids = df.iloc[0, 1:].astype(str).tolist()
+    y_raw = df.iloc[1, 1:].astype(str).to_numpy()
+
+    # gene rows start at index 3
+    gene_rows = df.iloc[3:, :]
+    genes = gene_rows.iloc[:, 0].astype(str).tolist()
+    counts = gene_rows.iloc[:, 1:].to_numpy(dtype=float).T  # shape: samples x genes
+
+    return sample_ids, y_raw, counts, genes
+
+def counts_to_logcpm(counts: np.ndarray) -> np.ndarray:
+    """
+    logCPM = log1p( 1e6 * counts / library_size )
+    """
+    lib = counts.sum(axis=1, keepdims=True)
+    lib[lib == 0] = 1.0
+    cpm = (counts / lib) * 1e6
+    return np.log1p(cpm)
+
+def expression_prevalence_filter(logcpm: np.ndarray, genes: list[str], cpm_threshold: float = 1.0, min_frac: float = 0.10):
+    """
+    Using logCPM, threshold CPM>cpm_threshold approximated by log1p(CPM)>log1p(threshold).
+    Keep genes where fraction of samples above threshold >= min_frac.
+    """
+    thr = np.log1p(cpm_threshold)
+    keep = (logcpm > thr).mean(axis=0) >= min_frac
+    kept_genes = [g for g, k in zip(genes, keep) if k]
+    return logcpm[:, keep], kept_genes
+
+def top_variance_genes(X: np.ndarray, genes: list[str], top_n: int) -> tuple[np.ndarray, list[str], np.ndarray]:
+    """
+    Select top_n genes by variance.
+    Return selected X, selected genes, indices.
+    """
+    v = np.var(X, axis=0)
+    idx = np.argsort(v)[::-1]
+    idx = idx[:min(top_n, X.shape[1])]
+    sel_genes = [genes[i] for i in idx]
+    return X[:, idx], sel_genes, idx
+
+# ---------------------------
+# Modeling
+# ---------------------------
+
+def build_ridge_pipeline(C: float) -> Pipeline:
+    """
+    Impute -> scale -> ridge logistic (liblinear works well for binary with L2).
+    """
+    clf = LogisticRegression(
+        penalty="l2",
+        C=C,
+        solver="liblinear",
+        class_weight="balanced",
+        max_iter=4000,
+    )
+    return Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler(with_mean=True, with_std=True)),
+        ("clf", clf),
+    ])
+
+def simplified_cv(
+    X: np.ndarray,
+    y: np.ndarray,
+    sample_ids: list[str],
+    genes: list[str],
+    outdir: str,
+    task_name: str,
+    C_fixed: float = 1.0,
+    n_splits: int = 5,
+    n_repeats: int = 5,
+    seed: int = 1,
+) -> dict:
+    """
+    Repeated stratified CV with fixed C and threshold=0.5.
+    Also does variance selection within each training fold (unsupervised).
+    """
+    rskf = RepeatedStratifiedKFold(n_splits=n_splits, n_repeats=n_repeats, random_state=seed)
+
+    preds = []
+    fold_metrics = []
+
+    for fold_i, (tr, te) in enumerate(rskf.split(X, y), start=1):
+        Xtr, Xte = X[tr], X[te]
+        ytr, yte = y[tr], y[te]
+
+        # Unsupervised variance selection in training fold
+        Xtr_sel, genes_sel, idx = top_variance_genes(Xtr, genes, top_n=200)
+        Xte_sel = Xte[:, idx]
+
+        pipe = build_ridge_pipeline(C=C_fixed)
+        pipe.fit(Xtr_sel, ytr)
+        pte = pipe.predict_proba(Xte_sel)[:, 1]
+
+        # threshold 0.5
+        pred = (pte >= 0.5).astype(int)
+        tp = int(np.sum((yte == 1) & (pred == 1)))
+        fn = int(np.sum((yte == 1) & (pred == 0)))
+        tn = int(np.sum((yte == 0) & (pred == 0)))
+        fp = int(np.sum((yte == 0) & (pred == 1)))
+
+        # discrimination
+        auc = roc_auc_score(yte, pte) if len(np.unique(yte)) == 2 else np.nan
+        ap  = average_precision_score(yte, pte) if len(np.unique(yte)) == 2 else np.nan
+        brier = brier_score_loss(yte, pte)
+
+        fold_metrics.append({
+            "task": task_name,
+            "cv": f"simplified_repeated_{n_splits}fold_x{n_repeats}",
+            "fold": fold_i,
+            "C": C_fixed,
+            "auc": auc,
+            "pr_auc": ap,
+            "brier": brier,
+            "tp": tp, "fn": fn, "tn": tn, "fp": fp,
+        })
+
+        for sid, yt, pp, pr in zip([sample_ids[i] for i in te], yte, pte, pred):
+            preds.append({
+                "task": task_name,
+                "cv": "simplified",
+                "fold": fold_i,
+                "sample_id": sid,
+                "y": int(yt),
+                "prob": float(pp),
+                "pred": int(pr),
+                "threshold": 0.5,
+                "C": C_fixed,
+            })
+
+    fold_df = pd.DataFrame(fold_metrics)
+    pred_df = pd.DataFrame(preds)
+
+    # Aggregate across all out-of-fold predictions
+    y_all = pred_df["y"].to_numpy()
+    p_all = pred_df["prob"].to_numpy()
+    auc_all = roc_auc_score(y_all, p_all) if len(np.unique(y_all)) == 2 else np.nan
+    ap_all  = average_precision_score(y_all, p_all) if len(np.unique(y_all)) == 2 else np.nan
+    brier_all = brier_score_loss(y_all, p_all)
+    ci, cs = calibration_intercept_slope(y_all, p_all)
+
+    # Accuracy at threshold=0.5 on pooled OOF
+    pred_all = (p_all >= 0.5).astype(int)
+    tp = int(np.sum((y_all == 1) & (pred_all == 1)))
+    fn = int(np.sum((y_all == 1) & (pred_all == 0)))
+    tn = int(np.sum((y_all == 0) & (pred_all == 0)))
+    fp = int(np.sum((y_all == 0) & (pred_all == 1)))
+    sens = tp / (tp + fn) if (tp + fn) > 0 else np.nan
+    spec = tn / (tn + fp) if (tn + fp) > 0 else np.nan
+    acc  = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else np.nan
+
+    # Bootstrap CIs on pooled OOF (simplified version)
+    boot = bootstrap_ci(y_all, p_all, n_boot=2000, seed=seed)
+
+    summary = {
+        "task": task_name,
+        "cv": "simplified",
+        "n": int(len(y_all)),
+        "pos": int(np.sum(y_all == 1)),
+        "neg": int(np.sum(y_all == 0)),
+        "auc": auc_all,
+        "auc_ci_low": boot["auc"][1],
+        "auc_ci_high": boot["auc"][2],
+        "pr_auc": ap_all,
+        "pr_auc_ci_low": boot["pr_auc"][1],
+        "pr_auc_ci_high": boot["pr_auc"][2],
+        "brier": brier_all,
+        "brier_ci_low": boot["brier"][1],
+        "brier_ci_high": boot["brier"][2],
+        "cal_intercept": ci,
+        "cal_intercept_ci_low": boot["cal_intercept"][1],
+        "cal_intercept_ci_high": boot["cal_intercept"][2],
+        "cal_slope": cs,
+        "cal_slope_ci_low": boot["cal_slope"][1],
+        "cal_slope_ci_high": boot["cal_slope"][2],
+        "threshold": 0.5,
+        "sensitivity": sens,
+        "specificity": spec,
+        "accuracy": acc,
+    }
+
+    ensure_dir(outdir)
+    fold_df.to_csv(os.path.join(outdir, f"{task_name}_simplified_fold_metrics.csv"), index=False)
+    pred_df.to_csv(os.path.join(outdir, f"{task_name}_simplified_oof_predictions.csv"), index=False)
+
+    return summary
+
+def nested_cv_foldwise_thresholding(
+    X: np.ndarray,
+    y: np.ndarray,
+    sample_ids: list[str],
+    genes: list[str],
+    outdir: str,
+    task_name: str,
+    C_grid=(0.01, 0.1, 1.0, 10.0),
+    outer_splits: int = 5,
+    inner_splits: int = 3,
+    repeats: int = 20,
+    seed: int = 1,
+    target_sens: float = 0.75,
+    top_genes_global: int = 5000,
+    top_genes_train: int = 200,
+) -> dict:
+    """
+    Repeated nested CV:
+      - Outer: stratified K folds, repeated
+      - Inner: stratified K folds for tuning C via PR-AUC
+      - Feature selection: unsupervised variance selection
+           * global prefilter by variance (optional) on outer training only
+           * then training variance selection top_genes_train on outer training only
+      - Fold-wise thresholding: choose threshold on inner-OOF (outer training) to meet sens>=target_sens with max spec
+      - Evaluate on outer test
+    """
+    rng = np.random.default_rng(seed)
+
+    records_pred = []
+    records_params = []
+    repeat_metrics = []
+
+    # For patient-level mean out-of-sample probs: accumulate per sample across repeats
+    # We'll store one test prob each time the sample appears in outer test
+    for rep in range(1, repeats + 1):
+        outer = StratifiedKFold(n_splits=outer_splits, shuffle=True, random_state=int(rng.integers(1, 1_000_000)))
+
+        for fold, (tr, te) in enumerate(outer.split(X, y), start=1):
+            Xtr, Xte = X[tr], X[te]
+            ytr, yte = y[tr], y[te]
+
+            genes_tr = genes
+
+            # Optional global variance prefilter within outer training only
+            if top_genes_global is not None and Xtr.shape[1] > top_genes_global:
+                Xtr_g, genes_g, idx_g = top_variance_genes(Xtr, genes_tr, top_n=top_genes_global)
+                Xte_g = Xte[:, idx_g]
+                genes_tr2 = genes_g
+            else:
+                Xtr_g = Xtr
+                Xte_g = Xte
+                genes_tr2 = genes_tr
+                idx_g = np.arange(Xtr.shape[1], dtype=int)
+
+            # Training-only variance selection to top_genes_train
+            Xtr_sel, genes_sel, idx_local = top_variance_genes(Xtr_g, genes_tr2, top_n=top_genes_train)
+            Xte_sel = Xte_g[:, idx_local]
+
+            # Inner tuning
+            inner = StratifiedKFold(n_splits=inner_splits, shuffle=True, random_state=int(rng.integers(1, 1_000_000)))
+            best_C = None
+            best_score = -np.inf
+
+            for C in C_grid:
+                aps = []
+                for itr, ite in inner.split(Xtr_sel, ytr):
+                    Xi_tr, Xi_te = Xtr_sel[itr], Xtr_sel[ite]
+                    yi_tr, yi_te = ytr[itr], ytr[ite]
+                    pipe = build_ridge_pipeline(C=C)
+                    pipe.fit(Xi_tr, yi_tr)
+                    pi = pipe.predict_proba(Xi_te)[:, 1]
+                    if len(np.unique(yi_te)) < 2:
+                        continue
+                    aps.append(average_precision_score(yi_te, pi))
+                score = float(np.mean(aps)) if len(aps) > 0 else -np.inf
+                if score > best_score:
+                    best_score = score
+                    best_C = float(C)
+
+            # Fit final model on outer training with best_C
+            final_pipe = build_ridge_pipeline(C=best_C)
+            final_pipe.fit(Xtr_sel, ytr)
+
+            # Create inner-OOF predictions on outer training to choose threshold (fold-wise)
+            # We'll do cross-validated prediction using the same inner splits and best_C
+            oof_prob = np.full(shape=(len(ytr),), fill_value=np.nan, dtype=float)
+            for itr, ite in inner.split(Xtr_sel, ytr):
+                pipe = build_ridge_pipeline(C=best_C)
+                pipe.fit(Xtr_sel[itr], ytr[itr])
+                oof_prob[ite] = pipe.predict_proba(Xtr_sel[ite])[:, 1]
+
+            # Some small folds could be NaN if inner split degenerate; fallback to fitted probs
+            if np.any(np.isnan(oof_prob)):
+                oof_prob = final_pipe.predict_proba(Xtr_sel)[:, 1]
+
+            thr_info = choose_threshold_sens_constraint(ytr, oof_prob, target_sens=target_sens)
+            thr = thr_info["threshold"]
+
+            # Test predictions
+            pte = final_pipe.predict_proba(Xte_sel)[:, 1]
+            pred = (pte >= thr).astype(int)
+
+            # Metrics for this outer fold (test)
+            auc = roc_auc_score(yte, pte) if len(np.unique(yte)) == 2 else np.nan
+            ap  = average_precision_score(yte, pte) if len(np.unique(yte)) == 2 else np.nan
+            brier = brier_score_loss(yte, pte)
+
+            tp = int(np.sum((yte == 1) & (pred == 1)))
+            fn = int(np.sum((yte == 1) & (pred == 0)))
+            tn = int(np.sum((yte == 0) & (pred == 0)))
+            fp = int(np.sum((yte == 0) & (pred == 1)))
+            sens = tp / (tp + fn) if (tp + fn) > 0 else np.nan
+            spec = tn / (tn + fp) if (tn + fp) > 0 else np.nan
+            acc  = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else np.nan
+
+            repeat_metrics.append({
+                "task": task_name,
+                "repeat": rep,
+                "outer_fold": fold,
+                "best_C": best_C,
+                "threshold": thr,
+                "test_auc": auc,
+                "test_pr_auc": ap,
+                "test_brier": brier,
+                "tp": tp, "fn": fn, "tn": tn, "fp": fp,
+                "test_sensitivity": sens,
+                "test_specificity": spec,
+                "test_accuracy": acc,
+                "train_threshold_met_constraint": thr_info["met_constraint"],
+                "train_sensitivity_at_thr": thr_info["sensitivity"],
+                "train_specificity_at_thr": thr_info["specificity"],
+            })
+
+            records_params.append({
+                "task": task_name,
+                "repeat": rep,
+                "outer_fold": fold,
+                "best_C": best_C,
+                "threshold": thr,
+                "inner_metric_pr_auc": best_score,
+                "train_threshold_met_constraint": thr_info["met_constraint"],
+                "train_sensitivity_at_thr": thr_info["sensitivity"],
+                "train_specificity_at_thr": thr_info["specificity"],
+            })
+
+            for sid, yt, pp, pr in zip([sample_ids[i] for i in te], yte, pte, pred):
+                records_pred.append({
+                    "task": task_name,
+                    "cv": "nested_foldwise",
+                    "repeat": rep,
+                    "outer_fold": fold,
+                    "sample_id": sid,
+                    "y": int(yt),
+                    "prob": float(pp),
+                    "pred": int(pr),
+                    "threshold": float(thr),
+                    "best_C": float(best_C),
+                })
+
+    pred_df = pd.DataFrame(records_pred)
+    params_df = pd.DataFrame(records_params)
+    rep_df = pd.DataFrame(repeat_metrics)
+
+    ensure_dir(outdir)
+    pred_df.to_csv(os.path.join(outdir, f"{task_name}_nested_foldwise_predictions_long.csv"), index=False)
+    params_df.to_csv(os.path.join(outdir, f"{task_name}_nested_foldwise_params_thresholds.csv"), index=False)
+    rep_df.to_csv(os.path.join(outdir, f"{task_name}_nested_foldwise_repeat_metrics.csv"), index=False)
+
+    # Patient/sample mean out-of-sample probability across repeats
+    mean_df = pred_df.groupby(["task", "sample_id"], as_index=False).agg(
+        y=("y", "first"),
+        mean_prob=("prob", "mean"),
+        sd_prob=("prob", "std"),
+        n_test=("prob", "size")
+    )
+
+    mean_df.to_csv(os.path.join(outdir, f"{task_name}_patient_mean_oos_probabilities.csv"), index=False)
+
+    # Compute summary metrics on mean probabilities (for bootstrap CI)
+    y_mean = mean_df["y"].to_numpy(dtype=int)
+    p_mean = mean_df["mean_prob"].to_numpy(dtype=float)
+
+    auc = roc_auc_score(y_mean, p_mean) if len(np.unique(y_mean)) == 2 else np.nan
+    ap  = average_precision_score(y_mean, p_mean) if len(np.unique(y_mean)) == 2 else np.nan
+    brier = brier_score_loss(y_mean, p_mean)
+    ci, cs = calibration_intercept_slope(y_mean, p_mean)
+
+    boot = bootstrap_ci(y_mean, p_mean, n_boot=2000, seed=seed)
+
+    # Average thresholded metrics across repeats (test-side)
+    rep_df["test_sensitivity"] = rep_df["test_sensitivity"].astype(float)
+    rep_df["test_specificity"] = rep_df["test_specificity"].astype(float)
+    rep_df["test_accuracy"] = rep_df["test_accuracy"].astype(float)
+
+    # Aggregate confusion across all outer tests (each sample appears multiple times). Prefer mean over repeats.
+    mean_test_sens = float(np.nanmean(rep_df["test_sensitivity"]))
+    mean_test_spec = float(np.nanmean(rep_df["test_specificity"]))
+    mean_test_acc  = float(np.nanmean(rep_df["test_accuracy"]))
+
+    summary = {
+        "task": task_name,
+        "cv": "nested_foldwise",
+        "repeats": int(repeats),
+        "outer_folds": int(outer_splits),
+        "inner_folds": int(inner_splits),
+        "C_grid": ",".join([str(c) for c in C_grid]),
+        "target_sensitivity_train": float(target_sens),
+        "n": int(len(y_mean)),
+        "pos": int(np.sum(y_mean == 1)),
+        "neg": int(np.sum(y_mean == 0)),
+        "auc": float(auc),
+        "auc_ci_low": float(boot["auc"][1]),
+        "auc_ci_high": float(boot["auc"][2]),
+        "pr_auc": float(ap),
+        "pr_auc_ci_low": float(boot["pr_auc"][1]),
+        "pr_auc_ci_high": float(boot["pr_auc"][2]),
+        "brier": float(brier),
+        "brier_ci_low": float(boot["brier"][1]),
+        "brier_ci_high": float(boot["brier"][2]),
+        "cal_intercept": float(ci),
+        "cal_intercept_ci_low": float(boot["cal_intercept"][1]),
+        "cal_intercept_ci_high": float(boot["cal_intercept"][2]),
+        "cal_slope": float(cs),
+        "cal_slope_ci_low": float(boot["cal_slope"][1]),
+        "cal_slope_ci_high": float(boot["cal_slope"][2]),
+        "mean_test_sensitivity_over_repeats": mean_test_sens,
+        "mean_test_specificity_over_repeats": mean_test_spec,
+        "mean_test_accuracy_over_repeats": mean_test_acc,
+    }
+
+    pd.DataFrame([summary]).to_csv(os.path.join(outdir, f"{task_name}_nested_foldwise_overall_summary.csv"), index=False)
+    return summary
+
+# ---------------------------
+# Main
+# ---------------------------
+
+def run_task(
+    task: str,
+    sample_ids_all: list[str],
+    y_raw_all: np.ndarray,
+    X_logcpm_all: np.ndarray,
+    genes_all: list[str],
+    outdir: str,
+    simplified: bool,
+    nested: bool,
+    repeats_nested: int,
+    seed: int,
+    target_sens: float,
+) -> list[dict]:
+    """
+    Prepare conditional subset and run evaluations.
+    """
+    # Map labels to ints
+    # y_raw_all are strings; ensure clean.
+    y_int = np.array([int(float(v)) for v in y_raw_all], dtype=int)
+
+    if task == "0vs1_event1":
+        mask = np.isin(y_int, [0, 1])
+        y = (y_int[mask] == 1).astype(int)  # event=1
+        task_name = "0vs1_event1"
+    elif task == "10vs11_event10":
+        mask = np.isin(y_int, [10, 11])
+        y = (y_int[mask] == 10).astype(int)  # event=10
+        task_name = "10vs11_event10"
+    else:
+        raise ValueError("Unknown task")
+
+    sample_ids = [sid for sid, m in zip(sample_ids_all, mask) if m]
+    X = X_logcpm_all[mask, :]
+    genes = genes_all
+
+    summaries = []
+
+    # Simplified CV
+    if simplified:
+        s = simplified_cv(
+            X=X, y=y,
+            sample_ids=sample_ids,
+            genes=genes,
+            outdir=outdir,
+            task_name=task_name,
+            C_fixed=1.0,
+            n_splits=5,
+            n_repeats=5,
+            seed=seed,
+        )
+        summaries.append(s)
+
+    # Nested CV with fold-wise thresholding
+    if nested:
+        s2 = nested_cv_foldwise_thresholding(
+            X=X, y=y,
+            sample_ids=sample_ids,
+            genes=genes,
+            outdir=outdir,
+            task_name=task_name,
+            C_grid=(0.01, 0.1, 1.0, 10.0),
+            outer_splits=5,
+            inner_splits=3,
+            repeats=repeats_nested,
+            seed=seed,
+            target_sens=target_sens,
+            top_genes_global=5000,
+            top_genes_train=200,
+        )
+        summaries.append(s2)
+
+    return summaries
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input_csv", required=True, help="Matrix-like RNA-seq total counts CSV")
+    ap.add_argument("--outdir", required=True, help="Output directory")
+    ap.add_argument("--run_simplified", action="store_true", help="Run simplified repeated CV")
+    ap.add_argument("--run_nested", action="store_true", help="Run nested CV with fold-wise thresholding")
+    ap.add_argument("--nested_repeats", type=int, default=20, help="Repeats for nested CV (outer loop)")
+    ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--target_sens", type=float, default=0.75, help="Target sensitivity for fold-wise thresholding (training)")
+    args = ap.parse_args()
+
+    ensure_dir(args.outdir)
+
+    # Load
+    sample_ids, y_raw, counts, genes = read_matrix_like_counts(args.input_csv)
+
+    # Normalize
+    X_logcpm = counts_to_logcpm(counts)
+
+    # Filter low-expression genes
+    X_logcpm, genes_f = expression_prevalence_filter(
+        X_logcpm, genes, cpm_threshold=1.0, min_frac=0.10
+    )
+
+    # Run both conditional tasks
+    all_summaries = []
+    for task in ["0vs1_event1", "10vs11_event10"]:
+        all_summaries.extend(
+            run_task(
+                task=task,
+                sample_ids_all=sample_ids,
+                y_raw_all=y_raw,
+                X_logcpm_all=X_logcpm,
+                genes_all=genes_f,
+                outdir=args.outdir,
+                simplified=args.run_simplified,
+                nested=args.run_nested,
+                repeats_nested=args.nested_repeats,
+                seed=args.seed,
+                target_sens=args.target_sens,
+            )
+        )
+
+    # Write combined summary
+    if len(all_summaries) > 0:
+        pd.DataFrame(all_summaries).to_csv(os.path.join(args.outdir, "overall_summary.csv"), index=False)
+
+if __name__ == "__main__":
+    main()
+
+
+python run_conditional_flt3_ml.py \
+  --input_csv "Merged_Total_counts_relapse_cohort, non-repeated.csv" \
+  --outdir results_nonrepeated \
+  --run_simplified \
+  --run_nested \
+  --nested_repeats 20 \
+  --target_sens 0.75
